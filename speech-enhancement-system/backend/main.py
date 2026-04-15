@@ -2,23 +2,30 @@
 
 from __future__ import annotations
 
+import json
+import os
+import re
 import uuid
 import logging
+import shutil
+from threading import Lock
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
 import numpy as np
 import soundfile as sf
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 from denoise_file_df2 import DF2Denoiser, denoise_file, _resample_if_needed
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 1600
@@ -32,6 +39,82 @@ DEEPFILTER_EPOCH = "best"
 WHISPER_MODEL = "tiny"
 WHISPER_DEVICE = "cpu"
 
+SUMMARIZER_MODEL = "sshleifer/distilbart-cnn-12-6"
+SUMMARIZER_MIN_WORDS = 40
+SUMMARIZER_MAX_CHUNK_TOKENS = 900
+
+
+class SummarizeRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+
+
+class TextSummarizer:
+    def __init__(self, model_name: str = SUMMARIZER_MODEL, device: str = "cpu"):
+        logger.info("Loading summarizer model %s on %s...", model_name, device)
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
+
+        self.model_name = model_name
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        pipeline_device = 0 if device != "cpu" else -1
+        self.pipeline = pipeline(
+            "summarization",
+            model=self.model,
+            tokenizer=self.tokenizer,
+            device=pipeline_device,
+        )
+        logger.info("Loaded summarizer model %s successfully", model_name)
+
+    def _chunk_text(self, text: str) -> list[str]:
+        token_ids = self.tokenizer(text, add_special_tokens=False, truncation=False)["input_ids"]
+        if not token_ids:
+            return []
+
+        chunks: list[str] = []
+        for start in range(0, len(token_ids), SUMMARIZER_MAX_CHUNK_TOKENS):
+            chunk_ids = token_ids[start : start + SUMMARIZER_MAX_CHUNK_TOKENS]
+            chunk_text = self.tokenizer.decode(chunk_ids, skip_special_tokens=True).strip()
+            if chunk_text:
+                chunks.append(chunk_text)
+        return chunks
+
+    def summarize(self, text: str) -> str:
+        normalized_text = " ".join(str(text or "").split())
+        if not normalized_text:
+            return ""
+
+        if len(normalized_text.split()) < SUMMARIZER_MIN_WORDS:
+            return normalized_text
+
+        chunk_summaries: list[str] = []
+        for chunk in self._chunk_text(normalized_text):
+            result = self.pipeline(
+                chunk,
+                max_length=130,
+                min_length=30,
+                do_sample=False,
+                truncation=True,
+            )
+            summary_text = result[0]["summary_text"].strip()
+            if summary_text:
+                chunk_summaries.append(summary_text)
+
+        if not chunk_summaries:
+            return normalized_text
+
+        combined_summary = " ".join(chunk_summaries).strip()
+        if len(chunk_summaries) > 1 and len(combined_summary.split()) >= SUMMARIZER_MIN_WORDS:
+            result = self.pipeline(
+                combined_summary,
+                max_length=130,
+                min_length=30,
+                do_sample=False,
+                truncation=True,
+            )
+            combined_summary = result[0]["summary_text"].strip()
+
+        return " ".join(combined_summary.split())
+
 
 class SessionManager:
     def __init__(self):
@@ -44,6 +127,7 @@ class SessionManager:
             "created_at": datetime.now().isoformat(),
             "audio_chunks": [],
             "cleaned_audio_chunks": [],
+            "sample_rate": SAMPLE_RATE,
             "original_transcript": [],
             "refined_transcript": [],
             "custom_filters": {},
@@ -59,31 +143,59 @@ class SessionManager:
             self.sessions[session_id]["is_active"] = False
 
 
-class TextProcessor:
-    def __init__(self):
-        self.custom_filters: Dict[str, Optional[str]] = {}
+def _normalize_custom_filters(filters: Optional[Dict[str, Optional[str]]]) -> Dict[str, Optional[str]]:
+    normalized: Dict[str, Optional[str]] = {}
+    for word, replacement in (filters or {}).items():
+        clean_word = str(word or "").strip()
+        if not clean_word:
+            continue
+        clean_replacement = "" if replacement is None else str(replacement).strip()
+        normalized[clean_word] = clean_replacement if clean_replacement else None
+    return normalized
 
-    def set_custom_filters(self, filters: Dict[str, Optional[str]]) -> None:
-        self.custom_filters = filters or {}
 
-    def process(self, text: str) -> str:
-        if not text:
-            return ""
+def _apply_custom_filters(text: str, filters: Optional[Dict[str, Optional[str]]]) -> str:
+    if not text:
+        return ""
 
-        result = text
-        for word, replacement in self.custom_filters.items():
-            if not word:
-                continue
-            if replacement is None:
-                replacement = ""
-            result = result.replace(word, replacement)
-            result = result.replace(word.lower(), replacement)
-            result = result.replace(word.upper(), replacement)
+    result = str(text)
+    for word, replacement in _normalize_custom_filters(filters).items():
+        pattern = re.compile(rf"\b{re.escape(word)}\b", flags=re.IGNORECASE)
+        result = pattern.sub(replacement or "", result)
 
-        result = " ".join(result.split())
-        if result:
-            result = result[0].upper() + result[1:]
-        return result
+    result = " ".join(result.split())
+    if result:
+        result = result[0].upper() + result[1:]
+    return result
+
+
+def _get_session_filters(session: Optional[Dict]) -> Dict[str, Optional[str]]:
+    if not session:
+        return {}
+    return _normalize_custom_filters(session.get("custom_filters", {}))
+
+
+def _rebuild_refined_transcript(session: Dict) -> str:
+    filters = _get_session_filters(session)
+    original_chunks = session.get("original_transcript", [])
+    refined_chunks = [_apply_custom_filters(chunk, filters) for chunk in original_chunks if chunk]
+    session["refined_transcript"] = [chunk for chunk in refined_chunks if chunk]
+    return " ".join(session["refined_transcript"]).strip()
+
+
+def _parse_custom_filters(raw_filters: Optional[str]) -> Dict[str, Optional[str]]:
+    if not raw_filters:
+        return {}
+
+    try:
+        parsed = json.loads(raw_filters)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="custom_filters must be valid JSON") from exc
+
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="custom_filters must be a JSON object")
+
+    return _normalize_custom_filters(parsed)
 
 
 class Transcriber:
@@ -156,7 +268,17 @@ session_manager = SessionManager()
 shared_denoiser: Optional[DF2Denoiser] = None
 shared_transcriber: Optional[Transcriber] = None
 streaming_transcriber: Optional[StreamingTranscriber] = None
-text_processor = TextProcessor()
+shared_summarizer: Optional[TextSummarizer] = None
+summarizer_lock = Lock()
+
+
+def _get_shared_summarizer() -> TextSummarizer:
+    global shared_summarizer
+    if shared_summarizer is None:
+        with summarizer_lock:
+            if shared_summarizer is None:
+                shared_summarizer = TextSummarizer(device="cpu")
+    return shared_summarizer
 
 
 def _save_transcript_file(session_id: str, original: str, refined: str) -> Path:
@@ -206,8 +328,30 @@ async def health():
         "models_loaded": {
             "denoiser": shared_denoiser is not None,
             "transcriber": shared_transcriber is not None,
+            "summarizer": shared_summarizer is not None,
         },
         "active_sessions": active,
+    }
+
+
+@app.post("/summarize")
+async def summarize_transcript(payload: SummarizeRequest):
+    text = " ".join(payload.text.split())
+    if not text:
+        raise HTTPException(status_code=400, detail="No transcript text provided")
+
+    try:
+        summarizer = _get_shared_summarizer()
+        summary = summarizer.summarize(text)
+    except Exception as exc:
+        logger.error("Summarization failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {
+        "summary": summary,
+        "model": SUMMARIZER_MODEL,
+        "source_word_count": len(text.split()),
+        "summary_word_count": len(summary.split()) if summary else 0,
     }
 
 
@@ -228,10 +372,16 @@ async def ws_audio(websocket: WebSocket):
             m_type = message.get("type")
 
             if m_type == "config":
-                filters = message.get("custom_filters", {})
+                filters = _normalize_custom_filters(message.get("custom_filters", {}))
                 session["custom_filters"] = filters
-                text_processor.set_custom_filters(filters)
-                await websocket.send_json({"type": "config_updated", "session_id": session_id})
+                refined_transcript = _rebuild_refined_transcript(session)
+                await websocket.send_json(
+                    {
+                        "type": "config_updated",
+                        "session_id": session_id,
+                        "refined_transcript": refined_transcript,
+                    }
+                )
                 continue
 
             if m_type == "audio_chunk":
@@ -240,6 +390,7 @@ async def ws_audio(websocket: WebSocket):
 
                 audio_data = np.array(message.get("data", []), dtype=np.float32)
                 sample_rate = int(message.get("sample_rate", SAMPLE_RATE))
+                session["sample_rate"] = sample_rate
                 if audio_data.size == 0:
                     continue
 
@@ -251,7 +402,7 @@ async def ws_audio(websocket: WebSocket):
                 original_text = (text or "").strip()
                 refined_text = ""
                 if original_text:
-                    refined_text = text_processor.process(original_text)
+                    refined_text = _apply_custom_filters(original_text, session.get("custom_filters", {}))
                     session["original_transcript"].append(original_text)
                     session["refined_transcript"].append(refined_text)
 
@@ -273,7 +424,9 @@ async def ws_audio(websocket: WebSocket):
                     final_text = (streaming_transcriber.flush() or "").strip()
                 if final_text:
                     session["original_transcript"].append(final_text)
-                    session["refined_transcript"].append(text_processor.process(final_text))
+                    session["refined_transcript"].append(
+                        _apply_custom_filters(final_text, session.get("custom_filters", {}))
+                    )
 
                 cleaned_chunks = session.get("cleaned_audio_chunks", [])
                 cleaned_audio = (
@@ -281,8 +434,18 @@ async def ws_audio(websocket: WebSocket):
                     if cleaned_chunks
                     else np.array([], dtype=np.float32)
                 )
-                audio_path = OUTPUT_DIR / f"cleaned_audio_{session_id}.wav"
-                sf.write(str(audio_path), cleaned_audio, SAMPLE_RATE)
+                original_chunks = session.get("audio_chunks", [])
+                original_audio = (
+                    np.concatenate([np.asarray(c, dtype=np.float32) for c in original_chunks])
+                    if original_chunks
+                    else np.array([], dtype=np.float32)
+                )
+                stream_sample_rate = int(session.get("sample_rate", SAMPLE_RATE))
+
+                cleaned_audio_path = OUTPUT_DIR / f"cleaned_audio_{session_id}.wav"
+                original_audio_path = OUTPUT_DIR / f"original_audio_{session_id}.wav"
+                sf.write(str(cleaned_audio_path), cleaned_audio, stream_sample_rate)
+                sf.write(str(original_audio_path), original_audio, stream_sample_rate)
 
                 original = " ".join(session.get("original_transcript", []))
                 refined = " ".join(session.get("refined_transcript", []))
@@ -294,6 +457,8 @@ async def ws_audio(websocket: WebSocket):
                         "session_id": session_id,
                         "download_urls": {
                             "audio": f"/download/audio/{session_id}",
+                            "original_audio": f"/download/audio/original/{session_id}",
+                            "cleaned_audio": f"/download/audio/cleaned/{session_id}",
                             "transcript": f"/download/transcript/{session_id}",
                         },
                     }
@@ -310,7 +475,7 @@ async def ws_audio(websocket: WebSocket):
 
 
 @app.post("/upload")
-async def upload_audio_file(file: UploadFile = File(...)):
+async def upload_audio_file(file: UploadFile = File(...), custom_filters: str = Form(default="")):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
 
@@ -324,6 +489,8 @@ async def upload_audio_file(file: UploadFile = File(...)):
     session_id = session_manager.create_session()
     temp_path = OUTPUT_DIR / f"temp_{session_id}{ext}"
     cleaned_audio_path = OUTPUT_DIR / f"cleaned_audio_{session_id}.wav"
+    original_audio_path = OUTPUT_DIR / f"original_audio_{session_id}.wav"
+    filters = _parse_custom_filters(custom_filters)
 
     try:
         with open(temp_path, "wb") as fh:
@@ -337,12 +504,20 @@ async def upload_audio_file(file: UploadFile = File(...)):
             epoch=DEEPFILTER_EPOCH,
         )
 
+        try:
+            original_audio, original_sr = sf.read(str(temp_path), dtype="float32")
+            if original_audio.ndim > 1:
+                original_audio = np.mean(original_audio, axis=1)
+            sf.write(str(original_audio_path), original_audio, original_sr)
+        except Exception:
+            shutil.copy2(temp_path, original_audio_path)
+
         cleaned_audio, cleaned_sr = sf.read(str(cleaned_audio_path), dtype="float32")
         if cleaned_audio.ndim > 1:
             cleaned_audio = np.mean(cleaned_audio, axis=1)
 
         original_text = shared_transcriber.transcribe(cleaned_audio, cleaned_sr)
-        refined_text = text_processor.process(original_text)
+        refined_text = _apply_custom_filters(original_text, filters)
 
         _save_transcript_file(session_id, original_text, refined_text)
 
@@ -352,6 +527,8 @@ async def upload_audio_file(file: UploadFile = File(...)):
             "refined_transcript": refined_text,
             "download_urls": {
                 "audio": f"/download/audio/{session_id}",
+                "original_audio": f"/download/audio/original/{session_id}",
+                "cleaned_audio": f"/download/audio/cleaned/{session_id}",
                 "transcript": f"/download/transcript/{session_id}",
             },
         }
@@ -369,6 +546,22 @@ async def download_audio(session_id: str):
     path = OUTPUT_DIR / f"cleaned_audio_{session_id}.wav"
     if not path.exists():
         raise HTTPException(status_code=404, detail="Audio file not found")
+    return FileResponse(str(path), media_type="audio/wav", filename=path.name)
+
+
+@app.get("/download/audio/original/{session_id}")
+async def download_original_audio(session_id: str):
+    path = OUTPUT_DIR / f"original_audio_{session_id}.wav"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Original audio file not found")
+    return FileResponse(str(path), media_type="audio/wav", filename=path.name)
+
+
+@app.get("/download/audio/cleaned/{session_id}")
+async def download_cleaned_audio(session_id: str):
+    path = OUTPUT_DIR / f"cleaned_audio_{session_id}.wav"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Cleaned audio file not found")
     return FileResponse(str(path), media_type="audio/wav", filename=path.name)
 
 
