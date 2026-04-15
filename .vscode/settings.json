@@ -1,0 +1,9 @@
+{
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/denoised/DeepFilterNet2/DeepFilterNet",
+    "${workspaceFolder}/denoised/DeepFilterNet2/pyDF",
+    "${workspaceFolder}/denoised/DeepFilterNet2/pyDF-data"
+  ]
+}{
+    "python-envs.defaultEnvManager": "ms-python.python:system"
+}
